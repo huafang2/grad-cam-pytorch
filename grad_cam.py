@@ -4,6 +4,7 @@
 # Author:   Kazuto Nakashima
 # URL:      http://kazuto1011.github.io
 # Created:  2017-05-26
+# add 3d pooling support by zhesheng xie. Apr., 2019
 
 from collections import OrderedDict, Sequence
 
@@ -27,7 +28,9 @@ class _BaseWrapper(object):
 
     def _encode_one_hot(self, ids):
         one_hot = torch.zeros_like(self.logits).to(self.device)
-        one_hot.scatter_(1, ids, 1.0)
+        #print(one_hot.shape)
+        one_hot[ids] = 1.0
+        #one_hot.scatter_(1, ids, 1.0)
         return one_hot
 
     def forward(self, image):
@@ -36,10 +39,9 @@ class _BaseWrapper(object):
         """
         self.model.zero_grad()
         self.logits = self.model(image)
-        self.probs = F.softmax(self.logits, dim=1)
-        return self.probs.sort(dim=1, descending=True)
+        return self.logits
 
-    def backward(self, ids):
+    def backward(self, gradient):
         """
         Class-specific backpropagation
 
@@ -47,9 +49,8 @@ class _BaseWrapper(object):
         1. self.logits.backward(gradient=one_hot, retain_graph=True)
         2. (self.logits * one_hot).sum().backward(retain_graph=True)
         """
-
-        one_hot = self._encode_one_hot(ids)
-        self.logits.backward(gradient=one_hot, retain_graph=True)
+        self.logits.backward(gradient=gradient)
+        #self.logits.backward(gradient=gradient, retain_graph=True)
 
     def generate(self):
         raise NotImplementedError
@@ -65,7 +66,7 @@ class _BaseWrapper(object):
 class BackPropagation(_BaseWrapper):
     def forward(self, image):
         self.image = image.requires_grad_()
-        return super(BackPropagation, self).forward(self.image)
+        return super(BackPropagation,self).forward(self.image)
 
     def generate(self):
         gradient = self.image.grad.clone()
@@ -126,10 +127,14 @@ class GradCAM(_BaseWrapper):
 
         def forward_hook(module, input, output):
             # Save featuremaps
+            '''print(output.shape)
+            print(id(module))'''
             self.fmap_pool[id(module)] = output.detach()
 
         def backward_hook(module, grad_in, grad_out):
             # Save the gradients correspond to the featuremaps
+            '''print(grad_out[0].shape)
+            print(id(module))'''
             self.grad_pool[id(module)] = grad_out[0].detach()
 
         # If any candidates are not specified, the hook is registered to all the layers.
@@ -147,29 +152,43 @@ class GradCAM(_BaseWrapper):
         raise ValueError("Invalid layer name: {}".format(target_layer))
 
     def _compute_grad_weights(self, grads):
-        return F.adaptive_avg_pool2d(grads, 1)
+        if len(grads.shape) == 4:
+            return F.adaptive_avg_pool2d(grads, 1)
+        else:
+            return F.adaptive_avg_pool3d(grads, 1)
 
     def forward(self, image):
-        self.image_shape = image.shape[2:]
-        return super(GradCAM, self).forward(image)
+        print("Input size:", image.shape)
+        self.clip_shape = image.shape[2:]
+        #return super().forward(image)
+        return super(GradCAM,self).forward(image)
 
     def generate(self, target_layer):
         fmaps = self._find(self.fmap_pool, target_layer)
         grads = self._find(self.grad_pool, target_layer)
         weights = self._compute_grad_weights(grads)
+        print("Feature map size:", fmaps.shape)
+        print("Weight size:", weights.shape)
 
         gcam = torch.mul(fmaps, weights).sum(dim=1, keepdim=True)
         gcam = F.relu(gcam)
 
-        gcam = F.interpolate(
-            gcam, self.image_shape, mode="bilinear", align_corners=False
-        )
+        print("raw gcam size:", gcam.shape)
 
-        B, C, H, W = gcam.shape
-        gcam = gcam.view(B, -1)
+        if len(gcam.shape) == 4:
+            gcam = F.interpolate(
+                gcam, self.clip_shape, mode="bilinear", align_corners=False
+                )
+        else:
+            gcam = F.interpolate(
+                gcam, self.clip_shape, mode="trilinear", align_corners=False
+            )
+
+        shape = gcam.shape
+        gcam = gcam.view(shape[0], -1)
         gcam -= gcam.min(dim=1, keepdim=True)[0]
         gcam /= gcam.max(dim=1, keepdim=True)[0]
-        gcam = gcam.view(B, C, H, W)
+        gcam = gcam.view(*shape)
 
         return gcam
 
